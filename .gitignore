@@ -1,0 +1,20 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Optional: Ignore raw input screenshots if you do not want them in repo
+input_file_*.png
