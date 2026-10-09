@@ -18,3 +18,7 @@ Thumbs.db
 
 # Optional: Ignore raw input screenshots if you do not want them in repo
 input_file_*.png
+
+*.joblib
+__pycache__/
+*.png

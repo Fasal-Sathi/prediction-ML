@@ -1,36 +1,130 @@
-import sys
+﻿import os
 import joblib
 import pandas as pd
 import numpy as np
 
-# 1. Load trained specialist models
-try:
-    specialists = joblib.load('model2_specialists.joblib')
-    print("Loaded specialist models successfully.")
-except Exception as e:
-    print(f"Error loading model2_specialists.joblib: {e}")
-    sys.exit(1)
+MODEL_PATH = "model2_specialists.joblib"
+specialists = None
+if os.path.exists(MODEL_PATH):
+    specialists = joblib.load(MODEL_PATH)
+else:
+    print(f"Warning: {MODEL_PATH} not found. Ensure models are trained.")
 
-# Agronomic Benchmark Targets (ICAR standards in kg/ha)
-OPTIMUM_NPK_BENCHMARKS = {
-    'RICE':         {'N': 100, 'P': 50, 'K': 50, 'water_sensitive': True,  'daily_water_mm': 50.0},
-    'WHEAT':        {'N': 120, 'P': 60, 'K': 40, 'water_sensitive': True,  'daily_water_mm': 30.0},
-    'MAIZE':        {'N': 120, 'P': 60, 'K': 40, 'water_sensitive': True,  'daily_water_mm': 35.0},
-    'CHICKPEA':     {'N': 20,  'P': 40, 'K': 20, 'water_sensitive': False, 'daily_water_mm': 20.0},
-    'SOYABEAN':     {'N': 30,  'P': 60, 'K': 40, 'water_sensitive': False, 'daily_water_mm': 25.0},
-    'GROUNDNUT':    {'N': 25,  'P': 50, 'K': 75, 'water_sensitive': False, 'daily_water_mm': 25.0},
-    'SUGARCANE':    {'N': 250, 'P': 100,'K': 120,'water_sensitive': True,  'daily_water_mm': 45.0},
-    'SUNFLOWER':    {'N': 60,  'P': 40, 'K': 30, 'water_sensitive': False, 'daily_water_mm': 25.0},
-    'BARLEY':       {'N': 60,  'P': 30, 'K': 20, 'water_sensitive': True,  'daily_water_mm': 25.0},
-    'LINSEED':      {'N': 40,  'P': 20, 'K': 20, 'water_sensitive': False, 'daily_water_mm': 20.0},
-    'MINOR PULSES': {'N': 20,  'P': 40, 'K': 20, 'water_sensitive': False, 'daily_water_mm': 20.0},
-    'OILSEEDS':     {'N': 50,  'P': 30, 'K': 30, 'water_sensitive': False, 'daily_water_mm': 25.0}
+try:
+    import shap
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
+_SHAP_EXPLAINERS = {}
+
+ECONOMICS = {
+    'COSTS': {
+        'UREA_PER_KG': 6.0,
+        'DAP_PER_KG': 27.0,
+        'MOP_PER_KG': 34.0,
+        'ELECTRICITY_PER_KWH': 7.0,
+        'PUMP_KW_PER_HP': 0.746,
+        'SEED_PER_KG': {
+            'WHEAT': 45.0, 'RICE': 50.0, 'MAIZE': 120.0, 'BARLEY': 40.0,
+            'CHICKPEA': 90.0, 'MINOR PULSES': 85.0,
+            'SOYABEAN': 80.0, 'GROUNDNUT': 95.0, 'SUNFLOWER': 220.0,
+            'LINSEED': 70.0, 'OILSEEDS': 90.0,
+            'SUGARCANE': 3.5
+        }
+    },
+    'MSP': {
+        'WHEAT': 2300.0, 'RICE': 2300.0, 'MAIZE': 2100.0, 'BARLEY': 1850.0,
+        'CHICKPEA': 5440.0, 'MINOR PULSES': 6600.0,
+        'SOYABEAN': 4892.0, 'GROUNDNUT': 6783.0, 'SUNFLOWER': 6760.0,
+        'LINSEED': 5200.0, 'OILSEEDS': 5650.0,
+        'SUGARCANE': 350.0
+    }
 }
 
-def predict_raw_yield(crop: str, state: str, soil: str, irrigated: bool,
-                      n_kg: float, p_kg: float, k_kg: float, rainfall_mm: float = 850.0):
-    crop_upper = crop.strip().upper()
-    
+AGRONOMIC_TARGETS = {
+    'WHEAT':        {'N_target': 120.0, 'P_target': 60.0, 'K_target': 40.0, 'moisture_optimum_pct': 55.0, 'water_depth_mm': 30.0, 'seed_rate_kg_per_acre': 40.0, 'seed_method': 'Line sowing at 20 cm row spacing with 4-5 cm depth'},
+    'RICE':         {'N_target': 100.0, 'P_target': 50.0, 'K_target': 50.0, 'moisture_optimum_pct': 70.0, 'water_depth_mm': 50.0, 'seed_rate_kg_per_acre': 15.0, 'seed_method': 'Nursery bed sowing for transplanting or 8-10 kg for DSR'},
+    'MAIZE':        {'N_target': 120.0, 'P_target': 60.0, 'K_target': 40.0, 'moisture_optimum_pct': 50.0, 'water_depth_mm': 35.0, 'seed_rate_kg_per_acre': 8.0,  'seed_method': 'Ridge and furrow planting at 60x20 cm spacing'},
+    'BARLEY':       {'N_target': 60.0,  'P_target': 30.0, 'K_target': 20.0, 'moisture_optimum_pct': 45.0, 'water_depth_mm': 25.0, 'seed_rate_kg_per_acre': 35.0, 'seed_method': 'Drill sowing at 22.5 cm row spacing'},
+    'CHICKPEA':     {'N_target': 20.0,  'P_target': 40.0, 'K_target': 20.0, 'moisture_optimum_pct': 40.0, 'water_depth_mm': 20.0, 'seed_rate_kg_per_acre': 30.0, 'seed_method': 'Seed drill at 30 cm spacing treated with Rhizobium'},
+    'MINOR PULSES': {'N_target': 20.0,  'P_target': 40.0, 'K_target': 20.0, 'moisture_optimum_pct': 40.0, 'water_depth_mm': 20.0, 'seed_rate_kg_per_acre': 10.0, 'seed_method': 'Broadcasting or line sowing at 30 cm spacing'},
+    'SOYABEAN':     {'N_target': 30.0,  'P_target': 60.0, 'K_target': 40.0, 'moisture_optimum_pct': 50.0, 'water_depth_mm': 25.0, 'seed_rate_kg_per_acre': 30.0, 'seed_method': 'Broad-bed furrow sowing at 45 cm row spacing'},
+    'GROUNDNUT':    {'N_target': 25.0,  'P_target': 50.0, 'K_target': 75.0, 'moisture_optimum_pct': 50.0, 'water_depth_mm': 25.0, 'seed_rate_kg_per_acre': 45.0, 'seed_method': 'Line planting with treated kernels at 30x10 cm spacing'},
+    'SUNFLOWER':    {'N_target': 60.0,  'P_target': 40.0, 'K_target': 30.0, 'moisture_optimum_pct': 45.0, 'water_depth_mm': 25.0, 'seed_rate_kg_per_acre': 3.0,  'seed_method': 'Dibbling seeds at 60x30 cm spacing'},
+    'LINSEED':      {'N_target': 40.0,  'P_target': 20.0, 'K_target': 20.0, 'moisture_optimum_pct': 40.0, 'water_depth_mm': 20.0, 'seed_rate_kg_per_acre': 12.0, 'seed_method': 'Line sowing at 25-30 cm row spacing'},
+    'OILSEEDS':     {'N_target': 50.0,  'P_target': 30.0, 'K_target': 30.0, 'moisture_optimum_pct': 45.0, 'water_depth_mm': 25.0, 'seed_rate_kg_per_acre': 5.0,  'seed_method': 'Line sowing at 30-45 cm spacing'},
+    'SUGARCANE':    {'N_target': 250.0, 'P_target': 100.0,'K_target': 120.0,'moisture_optimum_pct': 70.0, 'water_depth_mm': 50.0, 'seed_rate_kg_per_acre': 2500.0,'seed_method': 'Two/three-budded sett furrow planting at 90-120 cm spacing'}
+}
+
+CROP_ALIASES = {
+    'W': 'WHEAT', 'WHEAT': 'WHEAT',
+    'R': 'RICE', 'RICE': 'RICE', 'PADDY': 'RICE',
+    'M': 'MAIZE', 'MAIZE': 'MAIZE', 'CORN': 'MAIZE',
+    'B': 'BARLEY', 'BARLEY': 'BARLEY',
+    'C': 'CHICKPEA', 'CHICKPEA': 'CHICKPEA', 'GRAM': 'CHICKPEA', 'CHANA': 'CHICKPEA',
+    'P': 'MINOR PULSES', 'PULSES': 'MINOR PULSES', 'MINOR PULSES': 'MINOR PULSES',
+    'SOYA': 'SOYABEAN', 'SOYABEAN': 'SOYABEAN', 'SOYBEAN': 'SOYABEAN',
+    'G': 'GROUNDNUT', 'GROUNDNUT': 'GROUNDNUT', 'PEANUT': 'GROUNDNUT',
+    'SF': 'SUNFLOWER', 'SUNFLOWER': 'SUNFLOWER',
+    'L': 'LINSEED', 'LINSEED': 'LINSEED', 'ALSI': 'LINSEED',
+    'O': 'OILSEEDS', 'OILSEEDS': 'OILSEEDS', 'MUSTARD': 'OILSEEDS',
+    'S': 'SUGARCANE', 'SUGARCANE': 'SUGARCANE', 'GANA': 'SUGARCANE'
+}
+
+STATE_ALIASES = {
+    'MP': 'Madhya Pradesh', 'MADHYA PRADESH': 'Madhya Pradesh',
+    'PB': 'Punjab', 'PUNJAB': 'Punjab',
+    'HR': 'Haryana', 'HARYANA': 'Haryana',
+    'MH': 'Maharashtra', 'MAHARASHTRA': 'Maharashtra',
+    'UP': 'Uttar Pradesh', 'UTTAR PRADESH': 'Uttar Pradesh',
+    'RJ': 'Rajasthan', 'RAJASTHAN': 'Rajasthan',
+    'GJ': 'Gujarat', 'GUJARAT': 'Gujarat',
+    'BR': 'Bihar', 'BIHAR': 'Bihar',
+    'WB': 'West Bengal', 'WEST BENGAL': 'West Bengal',
+    'KA': 'Karnataka', 'KARNATAKA': 'Karnataka',
+    'AP': 'Andhra Pradesh', 'ANDHRA PRADESH': 'Andhra Pradesh',
+    'TS': 'Telangana', 'TELANGANA': 'Telangana',
+    'TN': 'Tamil Nadu', 'TAMIL NADU': 'Tamil Nadu',
+    'OD': 'Odisha', 'ODISHA': 'Odisha', 'ORISSA': 'Odisha'
+}
+
+STATE_DEFAULT_SOIL = {
+    'MADHYA PRADESH': 'VERTIC SOILS',
+    'MAHARASHTRA': 'VERTIC SOILS',
+    'GUJARAT': 'VERTIC SOILS',
+    'PUNJAB': 'INCEPTISOLS',
+    'HARYANA': 'INCEPTISOLS',
+    'UTTAR PRADESH': 'INCEPTISOLS',
+    'BIHAR': 'INCEPTISOLS',
+    'WEST BENGAL': 'INCEPTISOLS',
+    'RAJASTHAN': 'ARIDISOLS',
+    'KARNATAKA': 'ALFISOLS',
+    'ANDHRA PRADESH': 'ALFISOLS',
+    'TELANGANA': 'ALFISOLS',
+    'TAMIL NADU': 'ALFISOLS',
+    'ODISHA': 'ALFISOLS'
+}
+
+def normalize_crop_name(user_input: str) -> str:
+    cleaned = (user_input or "").strip().upper()
+    return CROP_ALIASES.get(cleaned, cleaned or "WHEAT")
+
+def normalize_state_name(user_input: str) -> str:
+    cleaned = (user_input or "").strip().upper()
+    return STATE_ALIASES.get(cleaned, (user_input or "Madhya Pradesh").strip().title())
+
+def resolve_soil_type(state: str, soil: str = None) -> str:
+    if soil and soil.strip().upper() not in ['', 'NONE', 'UNKNOWN', "DON'T KNOW"]:
+        return soil.strip().upper()
+    return STATE_DEFAULT_SOIL.get(state.strip().upper(), 'INCEPTISOLS')
+
+def prepare_feature_row(crop: str, state: str, soil: str, irrigated: bool,
+                        n_kg: float, p_kg: float, k_kg: float, rainfall_mm: float = 850.0):
+    crop_upper = normalize_crop_name(crop)
     fam_name = 'cereals'
     for f_name, data in specialists.items():
         if crop_upper in data['crops']:
@@ -38,24 +132,22 @@ def predict_raw_yield(crop: str, state: str, soil: str, irrigated: bool,
             break
             
     engine = specialists[fam_name]
-    model = engine['model']
     feature_names = engine['feature_names']
     
     row = pd.DataFrame(0.0, index=[0], columns=feature_names)
-    total_npk = n_kg + p_kg + k_kg
-    safe_npk = total_npk if total_npk > 0 else 1.0
+    total_npk = max(1.0, n_kg + p_kg + k_kg)
     irr_flag = 1.0 if irrigated else 0.0
     
-    row['Crop_Irrigated_Area_ha'] = 1.0 if irrigated else 0.0
+    row['Crop_Irrigated_Area_ha'] = irr_flag
     row['Is_Irrigated'] = irr_flag
     row['Total_District_Irrigated_1000_ha'] = 50.0
     row['Fertilizer_N_kg_per_ha'] = n_kg
     row['Fertilizer_P_kg_per_ha'] = p_kg
     row['Fertilizer_K_kg_per_ha'] = k_kg
     row['Fertilizer_NPK_Total_kg_per_ha'] = total_npk
-    row['N_Ratio'] = n_kg / safe_npk
-    row['P_Ratio'] = p_kg / safe_npk
-    row['K_Ratio'] = k_kg / safe_npk
+    row['N_Ratio'] = n_kg / total_npk
+    row['P_Ratio'] = p_kg / total_npk
+    row['K_Ratio'] = k_kg / total_npk
     row['Dominant_Soil_Percent'] = 70.0
     
     if 'Rainfall_Kharif_Monsoon' in row.columns:
@@ -63,219 +155,284 @@ def predict_raw_yield(crop: str, state: str, soil: str, irrigated: bool,
     if 'Moisture_Index' in row.columns:
         row['Moisture_Index'] = rainfall_mm * (1.0 + 0.5 * irr_flag)
         
-    for prefix, name in [('Crop_', crop_upper), ('State Name_', state), ('Dominant_Soil_Type_', soil)]:
+    resolved_soil = resolve_soil_type(state, soil)
+    for prefix, name in [('Crop_', crop_upper), ('State Name_', state), ('Dominant_Soil_Type_', resolved_soil)]:
         col = f"{prefix}{name}"
         if col in row.columns:
             row[col] = 1.0
             
-    pred_kg_ha = max(0.0, float(model.predict(row)[0]))
-    return pred_kg_ha / 247.105  # Convert kg/ha to Quintals/Acre
+    return fam_name, row
 
-def compute_smart_irrigation_prescription(crop: str, acres: float, soil_moisture_pct: float,
-                                         forecast_rain_mm_48h: float, pump_hp: float = 5.0):
-    """
-    Translates soil sensor readings and weather forecasts into concrete Liters & Pump Run Hours.
-    1 mm water over 1 acre = 4,047 Liters.
-    5 HP Agricultural Pump Discharge = ~25,000 Liters/hour.
-    """
-    crop_upper = crop.strip().upper()
-    benchmarks = OPTIMUM_NPK_BENCHMARKS.get(crop_upper, {'daily_water_mm': 30.0, 'water_sensitive': True})
-    target_depth_mm = benchmarks['daily_water_mm']
+def predict_raw_yield(crop: str, state: str, soil: str, irrigated: bool,
+                      n_kg: float, p_kg: float, k_kg: float, rainfall_mm: float = 850.0) -> float:
+    fam_name, row = prepare_feature_row(crop, state, soil, irrigated, n_kg, p_kg, k_kg, rainfall_mm)
+    model = specialists[fam_name]['model']
+    pred_kg_ha = max(0.0, float(model.predict(row)[0]))
+    return pred_kg_ha / 247.105
+
+def compute_shap_explainability(crop: str, state: str, soil: str, irrigated: bool,
+                                n_kg: float, p_kg: float, k_kg: float, rainfall_mm: float):
+    if not SHAP_AVAILABLE:
+        return {"active": False, "reason": "SHAP library not installed"}
     
-    current_water_mm = (soil_moisture_pct / 60.0) * target_depth_mm
-    raw_deficit_mm = max(0.0, target_depth_mm - current_water_mm)
-    effective_rain_mm = forecast_rain_mm_48h * 0.85
-    net_irrigation_depth_mm = max(0.0, raw_deficit_mm - effective_rain_mm)
+    fam_name, row = prepare_feature_row(crop, state, soil, irrigated, n_kg, p_kg, k_kg, rainfall_mm)
+    model = specialists[fam_name]['model']
     
-    total_water_liters = net_irrigation_depth_mm * 4047.0 * acres
-    liters_per_acre = net_irrigation_depth_mm * 4047.0
-    rain_liters_expected = effective_rain_mm * 4047.0 * acres
+    if fam_name not in _SHAP_EXPLAINERS:
+        try:
+            _SHAP_EXPLAINERS[fam_name] = shap.TreeExplainer(model)
+        except Exception:
+            _SHAP_EXPLAINERS[fam_name] = shap.Explainer(model, row)
+            
+    explainer = _SHAP_EXPLAINERS[fam_name]
+    shap_res = explainer(row)
     
-    pump_flow_lph = pump_hp * 5000.0
-    pump_hours_needed = (total_water_liters / pump_flow_lph) if total_water_liters > 0 else 0.0
+    base_val_q = float(shap_res.base_values[0]) / 247.105
+    shap_vals_q = shap_res.values[0] / 247.105
     
-    advice_lines = []
+    attributions = []
+    for col, val in zip(row.columns, shap_vals_q):
+        val_q = round(float(val), 2)
+        if abs(val_q) >= 0.05 and not col.startswith('State Name_'):
+            attributions.append({
+                "feature": col.replace('Fertilizer_', '').replace('Crop_', '').replace('Dominant_Soil_Type_', 'Soil: '),
+                "impact_q_acre": val_q,
+                "direction": "BOOST (+)" if val_q > 0 else "BOTTLENECK (-)"
+            })
+            
+    boosters = sorted([a for a in attributions if a['impact_q_acre'] > 0], key=lambda x: x['impact_q_acre'], reverse=True)
+    limiters = sorted([a for a in attributions if a['impact_q_acre'] < 0], key=lambda x: x['impact_q_acre'])
     
-    if forecast_rain_mm_48h >= raw_deficit_mm and raw_deficit_mm > 0:
-        decision = "HOLD IRRIGATION (DO NOT TURN ON PUMP)"
-        status = "HOLD"
-        advice_lines.append(f"Weather forecast predicts {forecast_rain_mm_48h:.1f} mm rain (~{rain_liters_expected:,.0f} Liters across plot) in next 48 hrs.")
-        advice_lines.append("Natural rainfall will satisfy crop root water needs.")
-        advice_lines.append("Pumping water now will waste electricity and cause waterlogging.")
-        trigger = False
-    elif forecast_rain_mm_48h > 0 and net_irrigation_depth_mm > 0:
-        decision = "PARTIAL SUPPLEMENTAL IRRIGATION"
-        status = "PARTIAL"
-        advice_lines.append(f"Weather API shows light rain of {forecast_rain_mm_48h:.1f} mm (~{rain_liters_expected:,.0f} Liters) coming.")
-        advice_lines.append(f"Rain is insufficient. Provide {total_water_liters:,.0f} Liters ({liters_per_acre:,.0f} L/Acre).")
-        advice_lines.append(f"Run {pump_hp:.0f} HP pump for ~{pump_hours_needed:.1f} hours ({int(pump_hours_needed * 60)} minutes).")
-        trigger = True
-    elif net_irrigation_depth_mm > 0:
-        decision = "CRITICAL IRRIGATION REQUIRED"
-        status = "CRITICAL"
-        advice_lines.append(f"No rain in 48-hr forecast. Soil moisture is low ({soil_moisture_pct:.1f}%).")
-        advice_lines.append(f"Apply {total_water_liters:,.0f} Liters across {acres:.1f} Acres ({liters_per_acre:,.0f} L/Acre).")
-        advice_lines.append(f"Run {pump_hp:.0f} HP pump for {pump_hours_needed:.1f} hours (~{pump_hours_needed/acres:.1f} hrs/acre).")
-        trigger = True
-    else:
-        decision = "OPTIMAL MOISTURE - NO IRRIGATION NEEDED"
-        status = "OPTIMAL"
-        advice_lines.append(f"Soil moisture is in optimal zone ({soil_moisture_pct:.1f}%).")
-        advice_lines.append("Re-check moisture readings in 48 hours.")
-        trigger = False
-        
     return {
-        "decision": decision,
-        "status": status,
-        "water_deficit_depth_mm": round(net_irrigation_depth_mm, 1),
-        "total_water_needed_liters": round(total_water_liters, 0),
-        "liters_per_acre": round(liters_per_acre, 0),
-        "recommended_pump_hours": round(pump_hours_needed, 1),
-        "advice_steps": advice_lines,
-        "pump_trigger": trigger
+        "active": True,
+        "regional_baseline_q_acre": round(base_val_q, 2),
+        "top_booster": boosters[0] if boosters else None,
+        "top_bottleneck": limiters[0] if limiters else None
     }
 
-def generate_prescriptive_report(crop: str, state: str, soil: str, acres: float,
-                                 current_irrigated: bool, current_n: float, current_p: float, current_k: float,
-                                 soil_moisture_pct: float = 35.0, forecast_rain_mm_48h: float = 0.0,
-                                 rainfall_mm: float = 850.0, pump_hp: float = 5.0):
-    crop_upper = crop.strip().upper()
-    benchmarks = OPTIMUM_NPK_BENCHMARKS.get(crop_upper, {'N': 80, 'P': 40, 'K': 30, 'water_sensitive': True})
+def generate_decision_audit(crop: str, state: str, soil: str, acres: float,
+                            applied_n: float, applied_p: float, applied_k: float,
+                            soil_moisture_pct: float, forecast_rain_mm_48h: float,
+                            farmer_seed_kg_total: float, pump_hp: float = 5.0):
+    crop_upper = normalize_crop_name(crop)
+    norm_state = normalize_state_name(state)
+    agro = AGRONOMIC_TARGETS.get(crop_upper, AGRONOMIC_TARGETS['WHEAT'])
+    msp = ECONOMICS['MSP'].get(crop_upper, 2300.0)
+    resolved_soil = resolve_soil_type(norm_state, soil)
     
-    baseline_yield = predict_raw_yield(crop, state, soil, current_irrigated, current_n, current_p, current_k, rainfall_mm)
-    yield_if_irrigated = predict_raw_yield(crop, state, soil, True, current_n, current_p, current_k, rainfall_mm)
-    irrigation_gain = max(0.0, yield_if_irrigated - baseline_yield) if not current_irrigated else 0.0
-    
-    opt_n, opt_p, opt_k = benchmarks['N'], benchmarks['P'], benchmarks['K']
-    yield_if_fert_opt = predict_raw_yield(crop, state, soil, current_irrigated, opt_n, opt_p, opt_k, rainfall_mm)
-    fert_gain = max(0.0, yield_if_fert_opt - baseline_yield)
-    
-    max_potential_yield = predict_raw_yield(crop, state, soil, True, opt_n, opt_p, opt_k, rainfall_mm)
-    total_possible_gain = max(0.0, max_potential_yield - baseline_yield)
-    
-    n_diff = current_n - opt_n
-    p_diff = current_p - opt_p
-    k_diff = current_k - opt_k
-    
-    fert_action = []
-    if n_diff > 25:
-        fert_action.append(f"REDUCE Nitrogen (Urea) by {abs(n_diff):.0f} kg/ha. You are over-applying nitrogen with zero yield return.")
-    elif n_diff < -20:
-        fert_action.append(f"INCREASE Nitrogen by {abs(n_diff):.0f} kg/ha to support crop vegetative growth.")
-    if p_diff < -15:
-        fert_action.append(f"ADD Phosphorus (DAP) by {abs(p_diff):.0f} kg/ha for healthy root initiation.")
-    if k_diff < -15:
-        fert_action.append(f"ADD Potash (MOP) by {abs(k_diff):.0f} kg/ha to fill grains and prevent lodging.")
-    if not fert_action:
-        fert_action.append("Current N-P-K nutrient application is balanced.")
-        
-    # Get physical water requirements
-    irr_plan = compute_smart_irrigation_prescription(crop, acres, soil_moisture_pct, forecast_rain_mm_48h, pump_hp)
-    
-    print("\n" + "="*68)
-    print("      FARMER ACTIONABLE PRESCRIPTION & OPTIMIZATION REPORT")
-    print("="*68)
-    print(f"Crop: {crop_upper} | Plot: {acres} Acres | State: {state} | Soil: {soil}")
-    print(f"Sensor Moisture: {soil_moisture_pct:.1f}% | 48h Weather Rain Forecast: {forecast_rain_mm_48h:.1f} mm")
-    print(f"Applied N-P-K: {current_n:.0f}-{current_p:.0f}-{current_k:.0f} kg/ha")
-    print("-"*68)
-    print(f" CURRENT PREDICTED YIELD:   {baseline_yield:.2f} Quintals/Acre  ({baseline_yield * acres:.1f} Q Total)")
-    print(f" MAXIMUM ACHIEVABLE YIELD: {max_potential_yield:.2f} Quintals/Acre  ({max_potential_yield * acres:.1f} Q Total)")
-    print(f" UNTAPPED YIELD GAP:       +{total_possible_gain:.2f} Quintals/Acre (+{(total_possible_gain / max(0.1, baseline_yield)) * 100:.1f}%)")
-    print("-"*68)
-    
-    print("\n 1. FERTILIZER PRESCRIPTION:")
-    print(f"    Target N-P-K for {crop_upper}: {opt_n} - {opt_p} - {opt_k} kg/ha")
-    for act in fert_action:
-        print(f"    • {act}")
-    if fert_gain > 0:
-        print(f"    Expected Gain from N-P-K Correction: +{fert_gain:.2f} Quintals/Acre")
+    is_irrigated = soil_moisture_pct >= 45.0
+    effective_rainfall = (soil_moisture_pct / 100.0) * 1000.0
 
-    print("\n 2. SMART IRRIGATION PRESCRIPTION (WEATHER & SENSOR INTEGRATED):")
-    print(f"    DECISION: >>> {irr_plan['decision']} <<<")
-    for line in irr_plan['advice_steps']:
-        print(f"    • {line}")
-    if irr_plan['total_water_needed_liters'] > 0:
-        print(f"    • Total Water Required: {irr_plan['total_water_needed_liters']:,.0f} Liters ({irr_plan['liters_per_acre']:,.0f} L/Acre)")
-        print(f"    • Tube-well Runtime: {irr_plan['recommended_pump_hours']:.1f} Hours on a {pump_hp:.0f} HP pump")
+    base_yield = predict_raw_yield(crop_upper, norm_state, resolved_soil, is_irrigated, applied_n, applied_p, applied_k, effective_rainfall)
+    base_harvest_q = base_yield * acres
 
-    print("\n 3. EXPECTED FINANCIAL BENEFIT:")
-    extra_q = total_possible_gain * acres
-    extra_rev = extra_q * 2300
-    print(f"    Estimated Net Grain Gain: ~{extra_q:.1f} Quintals across your {acres} Acres.")
-    print(f"    Estimated Revenue Increase: ~₹{extra_rev:,.0f} (at baseline MSP ₹2,300/Q).")
-    print("="*68 + "\n")
+    target_n = agro['N_target']
+    delta_n = target_n - applied_n
+    step_yield_n = predict_raw_yield(crop_upper, norm_state, resolved_soil, is_irrigated, target_n, applied_p, applied_k, effective_rainfall)
+    dy_n = max(0.0, step_yield_n - base_yield)
+    cost_n = (delta_n * acres) * ECONOMICS['COSTS']['UREA_PER_KG']
+    action_n = "DECREASE" if delta_n < 0 else ("INCREASE" if delta_n > 0 else "MAINTAIN")
+    impact_n = f"CASH SAVING of ₹{abs(cost_n):,.0f}" if delta_n < 0 else ("PROFIT GAIN" if delta_n > 0 else "OPTIMAL")
+    why_n = "Excess Nitrogen causes vegetative lodging without grain fill." if delta_n < 0 else "Provides chlorophyll for photosynthesis."
 
-def process_live_request(data: dict) -> dict:
-    """
-    Clean JSON API handler for Backend & ESP32.
-    """
-    crop = data.get('crop', 'WHEAT').upper()
-    state = data.get('state', 'Madhya Pradesh')
-    soil = data.get('soil', 'VERTIC SOILS')
-    acres = float(data.get('acres', 1.0))
-    pump_hp = float(data.get('pump_hp', 5.0))
+    target_p = agro['P_target']
+    delta_p = target_p - applied_p
+    step_yield_p = predict_raw_yield(crop_upper, norm_state, resolved_soil, is_irrigated, applied_n, target_p, applied_k, effective_rainfall)
+    dy_p = max(0.0, step_yield_p - base_yield)
+    cost_p = (delta_p * acres) * ECONOMICS['COSTS']['DAP_PER_KG']
+    action_p = "INCREASE" if delta_p > 0 else ("DECREASE" if delta_p < 0 else "MAINTAIN")
+    impact_p = "HIGH RETURN" if delta_p > 0 else (f"CASH SAVING of ₹{abs(cost_p):,.0f}" if delta_p < 0 else "OPTIMAL")
+    why_p = "Stimulates crown root expansion to pull subsoil moisture." if delta_p > 0 else "Maintains phosphorus equilibrium."
+
+    target_k = agro['K_target']
+    delta_k = target_k - applied_k
+    step_yield_k = predict_raw_yield(crop_upper, norm_state, resolved_soil, is_irrigated, applied_n, applied_p, target_k, effective_rainfall)
+    dy_k = max(0.0, step_yield_k - base_yield)
+    cost_k = (delta_k * acres) * ECONOMICS['COSTS']['MOP_PER_KG']
+    action_k = "INCREASE" if delta_k > 0 else ("DECREASE" if delta_k < 0 else "MAINTAIN")
+    impact_k = "HIGH RETURN" if delta_k > 0 else (f"CASH SAVING of ₹{abs(cost_k):,.0f}" if delta_k < 0 else "OPTIMAL")
+    why_k = "Hardens stalk against lodging and ensures full grain weight." if delta_k > 0 else "Potash concentration is optimal."
+
+    target_water_depth = agro['water_depth_mm']
+    current_water_depth = (soil_moisture_pct / agro['moisture_optimum_pct']) * target_water_depth
+    deficit_mm = max(0.0, target_water_depth - current_water_depth)
+    rain_effective = forecast_rain_mm_48h * 0.85
+    net_irr_mm = max(0.0, deficit_mm - rain_effective)
     
-    # Sensor telemetry + Weather API values
-    soil_moisture = float(data.get('soil_moisture_pct', 50.0))
-    forecast_rain_48h = float(data.get('forecast_rain_mm_48h', 0.0))
+    total_water_liters = net_irr_mm * 4047.0 * acres
+    pump_flow_lph = pump_hp * 5000.0
+    pump_hours = (total_water_liters / pump_flow_lph) if total_water_liters > 0 else 0.0
+
+    step_yield_irr = predict_raw_yield(crop_upper, norm_state, resolved_soil, True, applied_n, applied_p, applied_k, effective_rainfall)
+    dy_irr = max(0.0, step_yield_irr - base_yield) if net_irr_mm > 0 else 0.0
+
+    if forecast_rain_mm_48h >= deficit_mm and deficit_mm > 0:
+        action_irr = "HOLD"
+        impact_irr = "SAVE ELECTRICITY"
+        why_irr = f"Incoming 48h rain ({forecast_rain_mm_48h:.1f} mm) satisfies water needs."
+        pump_trigger = False
+    elif net_irr_mm > 0:
+        action_irr = "INCREASE"
+        impact_irr = "CRITICAL MOISTURE RECOVERY"
+        why_irr = "Water deficit stops root nutrient absorption; irrigation needed."
+        pump_trigger = True
+    else:
+        action_irr = "MAINTAIN"
+        impact_irr = "OPTIMAL"
+        why_irr = "Moisture level in root zone is optimal."
+        pump_trigger = False
+
+    test_n = max(applied_n, target_n) if delta_n >= 0 else target_n
+    test_p = max(applied_p, target_p)
+    test_k = max(applied_k, target_k)
+    raw_opt_yield = predict_raw_yield(crop_upper, norm_state, resolved_soil, True, test_n, test_p, test_k, effective_rainfall)
     
-    # N-P-K from user
-    current_n = float(data.get('applied_n_kg_ha', 100.0))
-    current_p = float(data.get('applied_p_kg_ha', 40.0))
-    current_k = float(data.get('applied_k_kg_ha', 20.0))
+    if raw_opt_yield >= base_yield:
+        optimal_yield = raw_opt_yield
+        mode = "YIELD_EXPANSION"
+    else:
+        optimal_yield = base_yield
+        mode = "COST_OPTIMIZATION"
+
+    yield_gap_val = max(0.0, optimal_yield - base_yield)
+    optimal_harvest_total = optimal_yield * acres
+    harvest_gain_total = max(0.0, optimal_harvest_total - base_harvest_q)
+    gross_recoverable = harvest_gain_total * msp
+    pct_increase = (yield_gap_val / max(0.01, base_yield)) * 100.0
+
+    impact_candidates = [
+        ("Phosphorus (DAP)", dy_p),
+        ("Potash (MOP)", dy_k),
+        ("Nitrogen (Urea)", dy_n),
+        ("Irrigation Water", dy_irr)
+    ]
+    dominant_factor_name, top_boost = max(impact_candidates, key=lambda x: x[1])
+    if mode == "COST_OPTIMIZATION" or top_boost <= 0.01:
+        dominant_factor_name = "Yield Preservation & Input Efficiency"
+        top_boost = 0.0
+
+    rec_seed_per_acre = agro.get('seed_rate_kg_per_acre', 40.0)
+    target_seed_total_kg = rec_seed_per_acre * acres
+    seed_cost_kg = ECONOMICS['COSTS']['SEED_PER_KG'].get(crop_upper, 45.0)
+    seed_delta_kg = target_seed_total_kg - farmer_seed_kg_total
     
-    is_irrigated = soil_moisture >= 45.0
-    effective_rainfall = (soil_moisture / 100.0) * 1000.0
-    
-    benchmarks = OPTIMUM_NPK_BENCHMARKS.get(crop, {'N': 80, 'P': 40, 'K': 30, 'water_sensitive': True})
-    
-    baseline_yield = predict_raw_yield(crop, state, soil, is_irrigated, current_n, current_p, current_k, effective_rainfall)
-    max_yield = predict_raw_yield(crop, state, soil, True, benchmarks['N'], benchmarks['P'], benchmarks['K'], effective_rainfall)
-    yield_gap = max(0.0, max_yield - baseline_yield)
-    
-    irr_plan = compute_smart_irrigation_prescription(crop, acres, soil_moisture, forecast_rain_48h, pump_hp)
-    
-    actions = []
-    if current_n > benchmarks['N'] + 20:
-        actions.append(f"Reduce Nitrogen by {current_n - benchmarks['N']:.0f} kg/ha")
-    elif current_n < benchmarks['N'] - 20:
-        actions.append(f"Add Nitrogen by {benchmarks['N'] - current_n:.0f} kg/ha")
-        
-    if current_p < benchmarks['P'] - 10:
-        actions.append(f"Add DAP by {benchmarks['P'] - current_p:.0f} kg/ha")
-    if current_k < benchmarks['K'] - 10:
-        actions.append(f"Add Potash by {benchmarks['K'] - current_k:.0f} kg/ha")
-        
+    if seed_delta_kg < -2.0:
+        seed_action = "DECREASE"
+        seed_diff = abs(seed_delta_kg)
+        seed_financial = f"CASH SAVINGS of ₹{seed_diff * seed_cost_kg:,.0f}"
+        seed_diagnosis = f"You are over-seeding by {seed_diff:.1f} kg. Excessive plant density causes high intra-crop competition for light and nutrients, resulting in weak, thin stalks."
+    elif seed_delta_kg > 2.0:
+        seed_action = "INCREASE"
+        seed_diff = seed_delta_kg
+        seed_financial = f"INVESTMENT of ₹{seed_diff * seed_cost_kg:,.0f}"
+        seed_diagnosis = f"You are under-seeding by {seed_diff:.1f} kg. Low seedling population leaves gaps in your field canopy, permitting weed dominance and losing potential yield."
+    else:
+        seed_action = "MAINTAIN"
+        seed_diff = 0.0
+        seed_financial = "OPTIMAL"
+        seed_diagnosis = "Your seed rate matches scientific plant population standards perfectly."
+
+    shap_results = compute_shap_explainability(crop_upper, norm_state, resolved_soil, is_irrigated, applied_n, applied_p, applied_k, effective_rainfall)
+
+    pros = []
+    cons = []
+    if applied_n >= target_n * 0.8:
+        pros.append("Solid vegetative vigor base from initial Nitrogen application.")
+    if applied_n > target_n + 20:
+        cons.append(f"Excess Urea of {applied_n - target_n:.0f} kg/ha: increases lodging risk and wastes expenditure.")
+    if applied_p < target_p - 10:
+        cons.append(f"DAP deficiency of {target_p - applied_p:.0f} kg/ha: limits lateral root expansion.")
+    else:
+        pros.append("Adequate root branching support from Phosphorus.")
+    if applied_k < target_k - 10:
+        cons.append(f"Potash deficiency of {target_k - applied_k:.0f} kg/ha: causes weak grain filling and thin stems.")
+    if soil_moisture_pct < 35.0 and forecast_rain_mm_48h == 0.0:
+        cons.append(f"Low soil moisture ({soil_moisture_pct:.1f}%): limits fertilizer uptake.")
+
+    factor_ledger = [
+        {
+            "factor_name": "Nitrogen (Urea)",
+            "current_value": applied_n,
+            "target_value": target_n,
+            "action": action_n,
+            "delta_units": round(abs(delta_n), 1),
+            "unit": "kg/ha",
+            "marginal_yield_delta_q_acre": round(dy_n, 2),
+            "financial_impact": impact_n,
+            "biological_why": why_n
+        },
+        {
+            "factor_name": "Phosphorus (DAP)",
+            "current_value": applied_p,
+            "target_value": target_p,
+            "action": action_p,
+            "delta_units": round(abs(delta_p), 1),
+            "unit": "kg/ha",
+            "marginal_yield_delta_q_acre": round(dy_p, 2),
+            "financial_impact": impact_p,
+            "biological_why": why_p
+        },
+        {
+            "factor_name": "Potash (MOP)",
+            "current_value": applied_k,
+            "target_value": target_k,
+            "action": action_k,
+            "delta_units": round(abs(delta_k), 1),
+            "unit": "kg/ha",
+            "marginal_yield_delta_q_acre": round(dy_k, 2),
+            "financial_impact": impact_k,
+            "biological_why": why_k
+        },
+        {
+            "factor_name": "Irrigation Water",
+            "current_value": soil_moisture_pct,
+            "target_value": agro['moisture_optimum_pct'],
+            "action": action_irr,
+            "delta_units": round(total_water_liters, 0),
+            "unit": "Liters",
+            "pump_hours": round(pump_hours, 1),
+            "marginal_yield_delta_q_acre": round(dy_irr, 2),
+            "financial_impact": impact_irr,
+            "biological_why": why_irr,
+            "pump_relay_trigger": pump_trigger
+        }
+    ]
+
     return {
         "status": "success",
-        "crop": crop,
-        "plot_acres": acres,
-        "predictions": {
-            "current_yield_q_acre": round(baseline_yield, 2),
-            "max_yield_q_acre": round(max_yield, 2),
-            "yield_gap_q_acre": round(yield_gap, 2),
-            "total_harvest_quintals": round(baseline_yield * acres, 1),
-            "potential_extra_revenue_inr": round(yield_gap * acres * 2300, 0)
+        "plot_summary": {
+            "crop": crop_upper,
+            "state": norm_state,
+            "soil_type": resolved_soil,
+            "acres": acres,
+            "mode": mode,
+            "base_yield_q_acre": round(base_yield, 2),
+            "optimal_yield_q_acre": round(optimal_yield, 2),
+            "yield_gap_q_acre": round(yield_gap_val, 2),
+            "base_harvest_total_q": round(base_harvest_q, 1),
+            "optimal_harvest_total_q": round(optimal_harvest_total, 1),
+            "harvest_gain_total_q": round(harvest_gain_total, 1),
+            "pct_increase": round(pct_increase, 1),
+            "primary_driver": dominant_factor_name,
+            "primary_driver_boost_q": round(top_boost, 2),
+            "gross_grain_value_inr": round(gross_recoverable, 0)
         },
-        "fertilizer_prescriptions": actions,
-        "irrigation_prescription": irr_plan,
-        "pump_trigger": irr_plan["pump_trigger"]
+        "seed_audit": {
+            "farmer_input_seed_kg": round(farmer_seed_kg_total, 1),
+            "recommended_total_seed_kg": round(target_seed_total_kg, 1),
+            "seed_rate_per_acre_kg": rec_seed_per_acre,
+            "action": seed_action,
+            "delta_units_kg": round(seed_diff, 1),
+            "financial_verdict": seed_financial,
+            "diagnosis": seed_diagnosis,
+            "sowing_protocol": agro.get('seed_method')
+        },
+        "shap_explainability": shap_results,
+        "scorecard": {
+            "pros": pros,
+            "cons": cons,
+            "highest_wasted_effort": "Urea Overdose" if delta_n < -20 else "None",
+            "highest_missed_return": "Irrigation Access" if net_irr_mm > 5.0 else "Phosphorus (DAP)"
+        },
+        "factor_breakdown": factor_ledger
     }
-
-if __name__ == '__main__':
-    # Test run: Wheat with low soil moisture and rain forecast
-    generate_prescriptive_report(
-        crop='WHEAT',
-        state='Madhya Pradesh',
-        soil='VERTIC SOILS',
-        acres=3.0,
-        current_irrigated=False,
-        current_n=150.0,
-        current_p=20.0,
-        current_k=10.0,
-        soil_moisture_pct=28.0,
-        forecast_rain_mm_48h=0.0,
-        rainfall_mm=650.0,
-        pump_hp=5.0
-    )
